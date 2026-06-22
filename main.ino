@@ -36,7 +36,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // Visual Animation Pointers
 const unsigned char* happyList[]   = { Irisoled::happy, Irisoled::excited, Irisoled::wink_left, Irisoled::wink_right };
 const unsigned char* sadList[]     = { Irisoled::sad, Irisoled::worried, Irisoled::scared, Irisoled::despair }; 
-const unsigned char* angryList[]   = { Irisoled::angry, Irisoled::furious, Irisoled::focused, Irisoled::warning };
+const unsigned char* angryList[]   = { Irisoled::angry, Irisoled::furious, Irisoled::focused};
 const unsigned char* neutralList[] = { Irisoled::normal, Irisoled::bored, Irisoled::sleepy, Irisoled::disoriented };
 
 const int happySize   = sizeof(happyList) / sizeof(happyList[0]);
