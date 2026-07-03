@@ -3,13 +3,17 @@
 #include <Adafruit_SSD1306.h>
 #include <Irisoled.h>
 #include <FS.h>
-#include <SPIFFS.h> // Internal flash file system engine
+#include <SPIFFS.h> 
 #include <WiFi.h>
 #include <WebServer.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define BUZZER_PIN 25 
+
+// LED Pin Allocations
+#define LED_GREEN_PIN 18
+#define LED_RED_PIN 19
 
 // Buttons: Up (0), Down (1), Left (2), Right (3), Play (4)
 const int btnPins[] = {13, 14, 27, 26, 32}; 
@@ -62,8 +66,19 @@ int totalQuestionsThisSession = 0;
 unsigned long accumulatedCorrectTime = 0;
 unsigned long accumulatedIncorrectTime = 0;
 
-// Tracking position to handle row modifications seamlessly
-long lastRowFilePosition = 0; 
+// Operational Session Counter
+unsigned long globalTurnCounter = 0;
+
+// Forward Declarations
+void renderMainMenu();
+void startNewRound();
+void commitSessionLog();
+void handleInputs();
+void handleWebInterface();
+void handleCSVDownload();
+void handleWipeData();
+void runContinuousAudioEngine(Emotion e);
+void runContinuousAnimationEngine(Emotion e);
 
 void setup() {
     Serial.begin(115200);
@@ -72,6 +87,12 @@ void setup() {
     for(int i=0; i<NUM_BTNS; i++) {
         pinMode(btnPins[i], INPUT_PULLUP);
     }
+
+    // Initialize LED indicators
+    pinMode(LED_GREEN_PIN, OUTPUT);
+    pinMode(LED_RED_PIN, OUTPUT);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_RED_PIN, LOW);
 
     ledcAttach(BUZZER_PIN, 1000, 8);
     ledcWrite(BUZZER_PIN, 0);
@@ -86,15 +107,18 @@ void setup() {
         for(;;);
     }
 
-    // Initialize the structure layout of the file if it does not exist yet
+    // Layout configuration containing exactly 6 columns
     if(!SPIFFS.exists("/metrics.csv")) {
         File file = SPIFFS.open("/metrics.csv", FILE_WRITE);
         if(file) {
-            file.println("Session_Duration_Ms,Total_Answers,Accuracy_Pct,Avg_Correct_Time_Ms,Avg_Incorrect_Time_Ms");
+            file.println("Turn_ID,Session_Duration_Ms,Total_Answers,Accuracy_Pct,Avg_Correct_Time_Ms,Avg_Incorrect_Time_Ms");
             file.close();
         }
     }
 
+    server.on("/", handleWebInterface);
+    server.on("/data.csv", handleCSVDownload);
+    server.on("/clear", handleWipeData);
     renderMainMenu(); 
 }
 
@@ -104,6 +128,20 @@ void loop() {
     }
 
     if (isRunning) {
+        // 5-Minute Inactivity Auto-Exit Check (300,000 ms)
+        if (millis() - roundStartTime >= 300000) {
+            ledcWrite(BUZZER_PIN, 0);
+            digitalWrite(LED_GREEN_PIN, LOW);
+            digitalWrite(LED_RED_PIN, LOW);
+            isRunning = false;
+            
+            if(totalQuestionsThisSession > 0) {
+                commitSessionLog();
+            }
+            renderMainMenu();
+            return; 
+        }
+
         runContinuousAudioEngine(roundTarget);
         runContinuousAnimationEngine(roundTarget);
     }
@@ -150,6 +188,9 @@ void renderSyncPortalScreen() {
 }
 
 void startNewRound() {
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_RED_PIN, LOW);
+
     roundTarget = (Emotion)random(0, 4);
     audioStep = 0; audioDir = 1; audioBurstCount = 0; currentFrameIndex = 0;
     audioPrevMillis = millis(); animPrevMillis = millis();
@@ -162,39 +203,22 @@ void startNewRound() {
     roundStartTime = millis(); 
 }
 
-// Converts data to an optimized, strict formatting line string
-String generateCSVLine() {
+// Fixed formatting maps 6 formatting parameters to 6 target inputs
+void commitSessionLog() {
+    if (totalQuestionsThisSession == 0) return;
+
     unsigned long duration = millis() - sessionStartTime;
-    float accuracy = 0.0;
-    if(totalQuestionsThisSession > 0) {
-        accuracy = ((float)currentCorrect / (float)totalQuestionsThisSession) * 100.0;
-    }
+    float accuracy = ((float)currentCorrect / (float)totalQuestionsThisSession) * 100.0;
     unsigned long avgCorrect = (currentCorrect > 0) ? (accumulatedCorrectTime / currentCorrect) : 0;
     unsigned long avgIncorrect = (currentWrong > 0) ? (accumulatedIncorrectTime / currentWrong) : 0;
 
-    return String(duration) + "," + String(totalQuestionsThisSession) + "," + String((int)accuracy) + "," + String(avgCorrect) + "," + String(avgIncorrect);
-}
-
-// Commits or overwrites data lines cleanly inside internal Flash storage
-void commitSessionLog(bool isModifyingLastLine) {
-    String dataLine = generateCSVLine();
-
-    if (isModifyingLastLine && lastRowFilePosition > 0) {
-        // Dynamic seek modification: Open in read/write mode and truncate down to the last checkpoint anchor
-        File file = SPIFFS.open("/metrics.csv", "r+");
-        if(file) {
-            file.seek(lastRowFilePosition);
-            file.println(dataLine);
-            file.close();
-        }
-    } else {
-        // Fresh entry write loop
-        File file = SPIFFS.open("/metrics.csv", FILE_APPEND);
-        if(file) {
-            lastRowFilePosition = file.position(); // Save position anchor to modify later if needed
-            file.println(dataLine);
-            file.close();
-        }
+    File file = SPIFFS.open("/metrics.csv", FILE_APPEND);
+    if (file) {
+        char newBuffer[128];
+        snprintf(newBuffer, sizeof(newBuffer), "%lu,%lu,%d,%d,%lu,%lu", 
+                 globalTurnCounter, duration, totalQuestionsThisSession, (int)accuracy, avgCorrect, avgIncorrect);
+        file.println(newBuffer);
+        file.close();
     }
 }
 
@@ -211,19 +235,21 @@ void handleInputs() {
                     if (i == 4) { 
                         if (currentMenuSelection == OPTION_GAME) {
                             isRunning = true;
+                            globalTurnCounter++; 
                             totalQuestionsThisSession = 0;
                             currentCorrect = 0; currentWrong = 0;
                             accumulatedCorrectTime = 0; accumulatedIncorrectTime = 0;
-                            lastRowFilePosition = 0;
-                            sessionStartTime = millis(); // Lock session timestamp entry
+                            sessionStartTime = millis(); 
                             startNewRound();
                         } else {
+                            WiFi.mode(WIFI_AP);
                             WiFi.softAP(apSSID, apPassword);
-                            server.on("/", handleWebInterface);
-                            server.on("/data.csv", handleCSVDownload);
-                            server.on("/clear", handleWipeData);
                             server.begin();
                             isSyncActive = true;
+                            
+                            digitalWrite(LED_GREEN_PIN, HIGH);
+                            digitalWrite(LED_RED_PIN, HIGH);
+                            
                             renderSyncPortalScreen();
                         }
                     }
@@ -232,18 +258,22 @@ void handleInputs() {
                 }
 
                 // === RUNTIME EVALUATION LOGIC ===
-                if (i == 4) { // PLAY Button: Explicit Session End Triggers File Closeout
+                if (i == 4) { // PLAY Button: Session exit mechanics
                     ledcWrite(BUZZER_PIN, 0);
+                    digitalWrite(LED_GREEN_PIN, LOW);
+                    digitalWrite(LED_RED_PIN, LOW);
+
                     if (isRunning) {
                         isRunning = false;
                         if(totalQuestionsThisSession > 0) {
-                            // Run immediate filesystem overwrite loop to guarantee metrics drop
-                            commitSessionLog(totalQuestionsThisSession % 5 != 1 && totalQuestionsThisSession > 5);
+                            commitSessionLog();
                         }
                     }
                     if (isSyncActive) {
                         isSyncActive = false;
-                        WiFi.softAPdisconnect(true);
+                        server.stop();              
+                        WiFi.softAPdisconnect(true); 
+                        WiFi.mode(WIFI_OFF);         
                     }
                     renderMainMenu();
                     while(digitalRead(btnPins[i]) == LOW); 
@@ -267,6 +297,10 @@ void handleInputs() {
                     if(wasCorrect) {
                         currentCorrect++;
                         accumulatedCorrectTime += responseDuration;
+                        
+                        digitalWrite(LED_GREEN_PIN, HIGH);
+                        digitalWrite(LED_RED_PIN, LOW);
+
                         display.drawTriangle(15, 35, 30, 50, 75, 15, WHITE); 
                         display.drawTriangle(15, 36, 30, 51, 75, 16, WHITE); 
                         ledcWriteTone(BUZZER_PIN, 600); ledcWrite(BUZZER_PIN, 10); delay(150);
@@ -274,6 +308,10 @@ void handleInputs() {
                     } else {
                         currentWrong++;
                         accumulatedIncorrectTime += responseDuration;
+                        
+                        digitalWrite(LED_GREEN_PIN, LOW);
+                        digitalWrite(LED_RED_PIN, HIGH);
+
                         display.drawLine(19, 12, 69, 52, WHITE);
                         display.drawLine(20, 12, 70, 52, WHITE); 
                         display.drawLine(69, 12, 19, 52, WHITE);
@@ -287,18 +325,23 @@ void handleInputs() {
                     display.setTextSize(1);
                     display.setCursor(85, 15); display.print("OK: "); display.print(currentCorrect);
                     display.setCursor(85, 35); display.print("X:  "); display.print(currentWrong);
-                    float accuracy = ((float)currentCorrect / (float)totalQuestionsThisSession) * 100.0;
+                    
+                    float accuracy = 0.0;
+                    if (totalQuestionsThisSession > 0) {
+                        accuracy = ((float)currentCorrect / (float)totalQuestionsThisSession) * 100.0;
+                    }
                     display.setCursor(85, 52); display.print((int)accuracy); display.print("%");
                     display.display();
                     
-                    // Paced Write Engine Rule: Every 5th question saves.
-                    // If it's the first batch of 5, create a new line. After that, modify the last line.
                     if (totalQuestionsThisSession % 5 == 0) {
-                        bool modifyMode = (totalQuestionsThisSession > 5);
-                        commitSessionLog(modifyMode);
+                        commitSessionLog();
                     }
 
                     delay(3000); 
+                    
+                    digitalWrite(LED_GREEN_PIN, LOW);
+                    digitalWrite(LED_RED_PIN, LOW);
+
                     while(digitalRead(btnPins[i]) == LOW); 
                     startNewRound(); 
                 }
@@ -307,7 +350,6 @@ void handleInputs() {
     }
 }
 
-// Server Dashboard Panel UI
 void handleWebInterface() {
     String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<style>body{font-family:sans-serif; background:#f4f6f9; padding:30px; text-align:center;}";
@@ -321,14 +363,13 @@ void handleWebInterface() {
     server.send(200, "text/html", html);
 }
 
-// Directly streams the real physical file from flash memory over the airwaves
 void handleCSVDownload() {
     File file = SPIFFS.open("/metrics.csv", "r");
     if (!file) {
         server.send(500, "text/plain", "File Missing");
         return;
     }
-    // Set headers to force the browser to treat it as an Excel spreadsheet file download
+    server.sendHeader("Content-Disposition", "attachment; filename=metrics.csv");
     server.streamFile(file, "text/csv");
     file.close();
 }
@@ -337,7 +378,7 @@ void handleWipeData() {
     SPIFFS.remove("/metrics.csv");
     File file = SPIFFS.open("/metrics.csv", FILE_WRITE);
     if(file) {
-        file.println("Session_Duration_Ms,Total_Answers,Accuracy_Pct,Avg_Correct_Time_Ms,Avg_Incorrect_Time_Ms");
+        file.println("Turn_ID,Session_Duration_Ms,Total_Answers,Accuracy_Pct,Avg_Correct_Time_Ms,Avg_Incorrect_Time_Ms");
         file.close();
     }
     String html = "<html><head><script>alert('CSV wiped successfully!'); window.location.href='/';</script></head></html>";
